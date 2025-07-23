@@ -36,8 +36,8 @@ jobs:
       - name: Create tag for manual release
         if: github.event_name == 'workflow_dispatch'
         run: |
-          git config user.name github-actions
-          git config user.email github-actions@github.com
+          git config user.name Walid ETTAYEB
+          git config user.email walid@ettayeb.fr
           git tag -a ${{ github.event.inputs.tag }} -m "Release ${{ github.event.inputs.tag }}"
           git push origin ${{ github.event.inputs.tag }}
           
