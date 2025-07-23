@@ -244,3 +244,4 @@ resource "godaddy_dns_record" "validated_record" {
   data   = "192.0.2.1"
   ttl    = 3600
 }
+```
