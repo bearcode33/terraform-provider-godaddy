@@ -1,0 +1,478 @@
+package provider
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/bearcode33/terraform-provider-godaddy/internal/godaddy"
+	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int32default"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int32planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+)
+
+var _ resource.Resource = &DNSRecordResource{}
+var _ resource.ResourceWithImportState = &DNSRecordResource{}
+
+func NewDNSRecordResource() resource.Resource {
+	return &DNSRecordResource{}
+}
+
+type DNSRecordResource struct {
+	client *godaddy.Client
+}
+
+type DNSRecordResourceModel struct {
+	ID       types.String `tfsdk:"id"`
+	Domain   types.String `tfsdk:"domain"`
+	Type     types.String `tfsdk:"type"`
+	Name     types.String `tfsdk:"name"`
+	Data     types.String `tfsdk:"data"`
+	TTL      types.Int32  `tfsdk:"ttl"`
+	Priority types.Int32  `tfsdk:"priority"`
+	Port     types.Int32  `tfsdk:"port"`
+	Weight   types.Int32  `tfsdk:"weight"`
+	Service  types.String `tfsdk:"service"`
+	Protocol types.String `tfsdk:"protocol"`
+}
+
+func (r *DNSRecordResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
+	resp.TypeName = req.ProviderTypeName + "_dns_record"
+}
+
+func (r *DNSRecordResource) Schema(ctx context.Context, req resource.SchemaRequest, resp *resource.SchemaResponse) {
+	resp.Schema = schema.Schema{
+		MarkdownDescription: "Manages a DNS record for a GoDaddy domain.",
+		Attributes: map[string]schema.Attribute{
+			"id": schema.StringAttribute{
+				MarkdownDescription: "The unique identifier for the DNS record.",
+				Computed:            true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"domain": schema.StringAttribute{
+				MarkdownDescription: "The domain name to add the record to.",
+				Required:            true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+			},
+			"type": schema.StringAttribute{
+				MarkdownDescription: "The DNS record type. Supported types: A, AAAA, CAA, CNAME, MX, NS, PTR, SOA, SRV, TXT, DS, SSHFP, TLSA, LOC, NAPTR, URI, CERT, DNAME.",
+				Required:            true,
+				Validators: []validator.String{
+					DNSRecordTypeValidator(),
+				},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+			},
+			"name": schema.StringAttribute{
+				MarkdownDescription: "The subdomain name for the record. Use @ for the root domain.",
+				Required:            true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+			},
+			"data": schema.StringAttribute{
+				MarkdownDescription: "The value of the record. Format varies by record type:\n" +
+					"- A: IPv4 address (e.g., 192.0.2.1)\n" +
+					"- AAAA: IPv6 address (e.g., 2001:db8::1)\n" +
+					"- CNAME: Target domain name (e.g., example.com)\n" +
+					"- MX: Mail server hostname (e.g., mail.example.com)\n" +
+					"- TXT: Text content (e.g., 'v=spf1 include:_spf.google.com ~all')\n" +
+					"- SRV: Target hostname (e.g., target.example.com)\n" +
+					"- CAA: CAA record format (e.g., '0 issue letsencrypt.org')\n" +
+					"- NS: Nameserver hostname (e.g., ns1.example.com)",
+				Required: true,
+				Validators: []validator.String{
+					DNSRecordDataValidator(),
+				},
+			},
+			"ttl": schema.Int32Attribute{
+				MarkdownDescription: "Time to live in seconds (minimum 600, maximum 2592000).",
+				Optional:            true,
+				Computed:            true,
+				Default:             int32default.StaticInt32(3600),
+				Validators: []validator.Int32{
+					TTLValidator(),
+				},
+			},
+			"priority": schema.Int32Attribute{
+				MarkdownDescription: "Priority for MX, SRV, NAPTR, and URI records (0-65535). Lower values have higher priority.",
+				Optional:            true,
+				Validators: []validator.Int32{
+					PriorityValidator(),
+				},
+				PlanModifiers: []planmodifier.Int32{
+					int32planmodifier.RequiresReplaceIfConfigured(),
+				},
+			},
+			"port": schema.Int32Attribute{
+				MarkdownDescription: "Port number for SRV records (1-65535).",
+				Optional:            true,
+				Validators: []validator.Int32{
+					PortValidator(),
+				},
+				PlanModifiers: []planmodifier.Int32{
+					int32planmodifier.RequiresReplaceIfConfigured(),
+				},
+			},
+			"weight": schema.Int32Attribute{
+				MarkdownDescription: "Weight for SRV and URI records (0-65535). Used for load balancing among records with the same priority.",
+				Optional:            true,
+				Validators: []validator.Int32{
+					WeightValidator(),
+				},
+				PlanModifiers: []planmodifier.Int32{
+					int32planmodifier.RequiresReplaceIfConfigured(),
+				},
+			},
+			"service": schema.StringAttribute{
+				MarkdownDescription: "Service name for SRV records (e.g., _sip, _http). Must start with underscore.",
+				Optional:            true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplaceIfConfigured(),
+				},
+			},
+			"protocol": schema.StringAttribute{
+				MarkdownDescription: "Protocol for SRV records (e.g., _tcp, _udp). Must start with underscore.",
+				Optional:            true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplaceIfConfigured(),
+				},
+			},
+		},
+	}
+}
+
+func (r *DNSRecordResource) Configure(ctx context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
+	if req.ProviderData == nil {
+		return
+	}
+
+	client, ok := req.ProviderData.(*godaddy.Client)
+	if !ok {
+		resp.Diagnostics.AddError(
+			"Unexpected Resource Configure Type",
+			fmt.Sprintf("Expected *godaddy.Client, got: %T. Please report this issue to the provider developers.", req.ProviderData),
+		)
+		return
+	}
+
+	r.client = client
+}
+
+func (r *DNSRecordResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	var data DNSRecordResourceModel
+
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &data)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// Validate record type and required fields
+	if err := r.validateRecord(&data); err != nil {
+		resp.Diagnostics.AddError(
+			"Invalid DNS Record Configuration",
+			err.Error(),
+		)
+		return
+	}
+
+	record := r.modelToRecord(&data)
+
+	// Add the record
+	err := r.client.AddDNSRecord(ctx, data.Domain.ValueString(), record)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error Creating DNS Record",
+			fmt.Sprintf("Could not create DNS record: %s", err),
+		)
+		return
+	}
+
+	// Generate ID
+	data.ID = types.StringValue(fmt.Sprintf("%s/%s/%s", data.Domain.ValueString(), data.Type.ValueString(), data.Name.ValueString()))
+
+	tflog.Trace(ctx, "created DNS record resource")
+	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
+}
+
+func (r *DNSRecordResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
+	var data DNSRecordResourceModel
+
+	resp.Diagnostics.Append(req.State.Get(ctx, &data)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	records, err := r.client.GetDNSRecordsByTypeAndName(ctx, data.Domain.ValueString(), data.Type.ValueString(), data.Name.ValueString())
+	if err != nil {
+		if strings.Contains(err.Error(), "404") {
+			resp.State.RemoveResource(ctx)
+			return
+		}
+		resp.Diagnostics.AddError(
+			"Error Reading DNS Record",
+			fmt.Sprintf("Could not read DNS record: %s", err),
+		)
+		return
+	}
+
+	if len(records) == 0 {
+		resp.State.RemoveResource(ctx)
+		return
+	}
+
+	// Find the matching record
+	for _, record := range records {
+		if record.Data == data.Data.ValueString() {
+			r.updateModelFromRecord(&data, &record)
+			break
+		}
+	}
+
+	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
+}
+
+func (r *DNSRecordResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	var data DNSRecordResourceModel
+	var state DNSRecordResourceModel
+
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &data)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// Get all records of this type and name
+	records, err := r.client.GetDNSRecordsByTypeAndName(ctx, data.Domain.ValueString(), data.Type.ValueString(), data.Name.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error Reading DNS Records",
+			fmt.Sprintf("Could not read DNS records: %s", err),
+		)
+		return
+	}
+
+	// Update the matching record
+	updated := false
+	for i, record := range records {
+		if record.Data == state.Data.ValueString() {
+			// Update this record
+			records[i] = r.modelToRecord(&data)
+			updated = true
+			break
+		}
+	}
+
+	if !updated {
+		resp.Diagnostics.AddError(
+			"DNS Record Not Found",
+			"The DNS record to update was not found",
+		)
+		return
+	}
+
+	// Replace all records of this type and name
+	err = r.client.ReplaceDNSRecordsByTypeAndName(ctx, data.Domain.ValueString(), data.Type.ValueString(), data.Name.ValueString(), records)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error Updating DNS Record",
+			fmt.Sprintf("Could not update DNS record: %s", err),
+		)
+		return
+	}
+
+	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
+}
+
+func (r *DNSRecordResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
+	var data DNSRecordResourceModel
+
+	resp.Diagnostics.Append(req.State.Get(ctx, &data)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// Get all records of this type and name
+	records, err := r.client.GetDNSRecordsByTypeAndName(ctx, data.Domain.ValueString(), data.Type.ValueString(), data.Name.ValueString())
+	if err != nil {
+		if strings.Contains(err.Error(), "404") {
+			// Already deleted
+			return
+		}
+		resp.Diagnostics.AddError(
+			"Error Reading DNS Records",
+			fmt.Sprintf("Could not read DNS records: %s", err),
+		)
+		return
+	}
+
+	// Remove the matching record
+	newRecords := make([]godaddy.DNSRecord, 0, len(records)-1)
+	for _, record := range records {
+		if record.Data != data.Data.ValueString() {
+			newRecords = append(newRecords, record)
+		}
+	}
+
+	if len(newRecords) == 0 {
+		// Delete all records of this type and name
+		err = r.client.DeleteDNSRecord(ctx, data.Domain.ValueString(), data.Type.ValueString(), data.Name.ValueString())
+	} else {
+		// Replace with remaining records
+		err = r.client.ReplaceDNSRecordsByTypeAndName(ctx, data.Domain.ValueString(), data.Type.ValueString(), data.Name.ValueString(), newRecords)
+	}
+
+	if err != nil && !strings.Contains(err.Error(), "404") {
+		resp.Diagnostics.AddError(
+			"Error Deleting DNS Record",
+			fmt.Sprintf("Could not delete DNS record: %s", err),
+		)
+		return
+	}
+}
+
+func (r *DNSRecordResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	// Expected format: domain/type/name/data
+	parts := strings.Split(req.ID, "/")
+	if len(parts) != 4 {
+		resp.Diagnostics.AddError(
+			"Invalid Import ID",
+			"Import ID must be in the format: domain/type/name/data",
+		)
+		return
+	}
+
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("domain"), parts[0])...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("type"), parts[1])...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("name"), parts[2])...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("data"), parts[3])...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), req.ID)...)
+}
+
+func (r *DNSRecordResource) modelToRecord(model *DNSRecordResourceModel) godaddy.DNSRecord {
+	record := godaddy.DNSRecord{
+		Type: model.Type.ValueString(),
+		Name: model.Name.ValueString(),
+		Data: model.Data.ValueString(),
+		TTL:  int(model.TTL.ValueInt32()),
+	}
+
+	if !model.Priority.IsNull() {
+		priority := int(model.Priority.ValueInt32())
+		record.Priority = &priority
+	}
+
+	if !model.Port.IsNull() {
+		port := int(model.Port.ValueInt32())
+		record.Port = &port
+	}
+
+	if !model.Weight.IsNull() {
+		weight := int(model.Weight.ValueInt32())
+		record.Weight = &weight
+	}
+
+	if !model.Service.IsNull() {
+		service := model.Service.ValueString()
+		record.Service = &service
+	}
+
+	if !model.Protocol.IsNull() {
+		protocol := model.Protocol.ValueString()
+		record.Protocol = &protocol
+	}
+
+	return record
+}
+
+func (r *DNSRecordResource) updateModelFromRecord(model *DNSRecordResourceModel, record *godaddy.DNSRecord) {
+	model.Type = types.StringValue(record.Type)
+	model.Name = types.StringValue(record.Name)
+	model.Data = types.StringValue(record.Data)
+	model.TTL = types.Int32Value(int32(record.TTL))
+
+	if record.Priority != nil {
+		model.Priority = types.Int32Value(int32(*record.Priority))
+	} else {
+		model.Priority = types.Int32Null()
+	}
+
+	if record.Port != nil {
+		model.Port = types.Int32Value(int32(*record.Port))
+	} else {
+		model.Port = types.Int32Null()
+	}
+
+	if record.Weight != nil {
+		model.Weight = types.Int32Value(int32(*record.Weight))
+	} else {
+		model.Weight = types.Int32Null()
+	}
+
+	if record.Service != nil {
+		model.Service = types.StringValue(*record.Service)
+	} else {
+		model.Service = types.StringNull()
+	}
+
+	if record.Protocol != nil {
+		model.Protocol = types.StringValue(*record.Protocol)
+	} else {
+		model.Protocol = types.StringNull()
+	}
+}
+
+func (r *DNSRecordResource) validateRecord(model *DNSRecordResourceModel) error {
+	recordType := model.Type.ValueString()
+	requiredFields := godaddy.DNSRecordRequiredFields(recordType)
+
+	// Validate data format
+	if err := godaddy.ValidateRecordData(recordType, model.Data.ValueString()); err != nil {
+		return fmt.Errorf("invalid data for %s record: %w", recordType, err)
+	}
+
+	// Check required fields based on record type
+	if requiredFields["priority"] && model.Priority.IsNull() {
+		return fmt.Errorf("%s records require a priority value", recordType)
+	}
+
+	if requiredFields["port"] && model.Port.IsNull() {
+		return fmt.Errorf("%s records require a port value", recordType)
+	}
+
+	if requiredFields["weight"] && model.Weight.IsNull() {
+		return fmt.Errorf("%s records require a weight value", recordType)
+	}
+
+	// SRV-specific validations
+	if recordType == "SRV" {
+		if model.Service.IsNull() || model.Protocol.IsNull() {
+			return fmt.Errorf("SRV records require both service and protocol fields")
+		}
+
+		service := model.Service.ValueString()
+		protocol := model.Protocol.ValueString()
+
+		if !strings.HasPrefix(service, "_") {
+			return fmt.Errorf("SRV service must start with underscore (e.g., _sip)")
+		}
+
+		if !strings.HasPrefix(protocol, "_") {
+			return fmt.Errorf("SRV protocol must start with underscore (e.g., _tcp)")
+		}
+	}
+
+	return nil
+}
