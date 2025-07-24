@@ -387,10 +387,31 @@ func (r *DNSRecordResource) Update(ctx context.Context, req resource.UpdateReque
 	}
 
 	if !updated {
-		resp.Diagnostics.AddError(
-			"DNS Record Not Found",
-			"The DNS record to update was not found",
-		)
+		// Enregistrement spécifique non trouvé dans la liste - comportement upsert (créer)
+		tflog.Info(ctx, "Specific DNS record data not found in existing records - creating new record (upsert behavior)", map[string]interface{}{
+			"domain": data.Domain.ValueString(),
+			"type":   data.Type.ValueString(),
+			"name":   data.Name.ValueString(),
+			"data":   data.Data.ValueString(),
+			"existingRecordsCount": len(records),
+		})
+		
+		// Ajouter le nouvel enregistrement à la liste existante
+		newRecord := r.modelToRecord(&data)
+		records = append(records, newRecord)
+		
+		// Remplacer tous les enregistrements avec la nouvelle liste incluant le nouvel enregistrement
+		err = r.client.ReplaceDNSRecordsByTypeAndName(ctx, data.Domain.ValueString(), data.Type.ValueString(), data.Name.ValueString(), records)
+		if err != nil {
+			resp.Diagnostics.AddError(
+				"Error Creating DNS Record During Update",
+				fmt.Sprintf("Could not create DNS record during update (upsert): %s", err),
+			)
+			return
+		}
+		
+		// Update the state with the new record
+		resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 		return
 	}
 
