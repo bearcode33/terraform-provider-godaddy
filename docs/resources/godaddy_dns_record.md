@@ -156,6 +156,30 @@ resource "godaddy_dns_record" "tlsa" {
 }
 ```
 
+### Conflict Resolution
+
+```terraform
+# Overwriting existing DNS records
+resource "godaddy_dns_record" "api_overwrite" {
+  domain         = "example.com"
+  type           = "A"
+  name           = "api"
+  data           = "192.0.2.100"
+  ttl            = 3600
+  allow_overwrite = true  # Will replace any existing A record for api.example.com
+}
+
+# Safe creation (default behavior)
+resource "godaddy_dns_record" "api_safe" {
+  domain         = "example.com"
+  type           = "A"
+  name           = "api"
+  data           = "192.0.2.101"
+  ttl            = 3600
+  allow_overwrite = false  # Will fail if record already exists (default)
+}
+```
+
 ### Advanced Records
 
 ```terraform
@@ -207,6 +231,7 @@ resource "godaddy_dns_record" "location" {
 - `port` (Number) - Port number for SRV records. Range: 1-65535. Required for SRV records.
 - `service` (String) - Service name for SRV records (must start with underscore). Required for SRV records.
 - `protocol` (String) - Protocol for SRV records (must start with underscore). Required for SRV records.
+- `allow_overwrite` (Boolean) - Whether to overwrite existing DNS records with the same type and name. Default: `false`. When `false`, creation will fail if a conflicting record exists. When `true`, existing records will be replaced.
 
 ### Read-Only
 
@@ -307,6 +332,12 @@ terraform import godaddy_dns_record.mx "example.com/MX/@/mail.example.com"
 - Multiple records of the same type and name are supported (e.g., multiple MX records)
 - Each record is managed as a separate Terraform resource
 
+### Record Conflicts and Overwriting
+- By default, attempting to create a DNS record that conflicts with an existing record will fail
+- Set `allow_overwrite = true` to replace existing records with the same type and name
+- This is useful for migration scenarios or when you need to ensure specific record values
+- Use with caution as it will permanently replace existing DNS data
+
 ### DNS Propagation
 - DNS changes may take time to propagate globally
 - Use online DNS propagation checkers to verify changes
@@ -325,4 +356,7 @@ TTL must be at least 600 seconds (10 minutes)
 
 Error: Invalid Priority
 Priority must be between 0 and 65535
+
+Error: DNS Record Already Exists
+A DNS record of type A with name "api" already exists for domain "example.com". Set allow_overwrite = true to replace the existing record, or use a different name.
 ```

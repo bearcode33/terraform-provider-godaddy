@@ -9,6 +9,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int32default"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int32planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
@@ -30,17 +31,18 @@ type DNSRecordResource struct {
 }
 
 type DNSRecordResourceModel struct {
-	ID       types.String `tfsdk:"id"`
-	Domain   types.String `tfsdk:"domain"`
-	Type     types.String `tfsdk:"type"`
-	Name     types.String `tfsdk:"name"`
-	Data     types.String `tfsdk:"data"`
-	TTL      types.Int32  `tfsdk:"ttl"`
-	Priority types.Int32  `tfsdk:"priority"`
-	Port     types.Int32  `tfsdk:"port"`
-	Weight   types.Int32  `tfsdk:"weight"`
-	Service  types.String `tfsdk:"service"`
-	Protocol types.String `tfsdk:"protocol"`
+	ID             types.String `tfsdk:"id"`
+	Domain         types.String `tfsdk:"domain"`
+	Type           types.String `tfsdk:"type"`
+	Name           types.String `tfsdk:"name"`
+	Data           types.String `tfsdk:"data"`
+	TTL            types.Int32  `tfsdk:"ttl"`
+	Priority       types.Int32  `tfsdk:"priority"`
+	Port           types.Int32  `tfsdk:"port"`
+	Weight         types.Int32  `tfsdk:"weight"`
+	Service        types.String `tfsdk:"service"`
+	Protocol       types.String `tfsdk:"protocol"`
+	AllowOverwrite types.Bool   `tfsdk:"allow_overwrite"`
 }
 
 func (r *DNSRecordResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -150,6 +152,15 @@ func (r *DNSRecordResource) Schema(ctx context.Context, req resource.SchemaReque
 					stringplanmodifier.RequiresReplaceIfConfigured(),
 				},
 			},
+			"allow_overwrite": schema.BoolAttribute{
+				MarkdownDescription: "Allow overwriting existing DNS records with the same type and name. " +
+					"When set to true, if a DNS record with the same domain, type, and name already exists, " +
+					"it will be replaced with the new configuration. When false (default), creation will fail " +
+					"if a conflicting record exists. This is useful for migrating existing DNS records to Terraform management.",
+				Optional: true,
+				Computed: true,
+				Default:  booldefault.StaticBool(false),
+			},
 		},
 	}
 }
@@ -190,14 +201,83 @@ func (r *DNSRecordResource) Create(ctx context.Context, req resource.CreateReque
 
 	record := r.modelToRecord(&data)
 
-	// Add the record
-	err := r.client.AddDNSRecord(ctx, data.Domain.ValueString(), record)
+	// Check for existing records to handle allow_overwrite logic
+	existingRecords, err := r.client.GetDNSRecordsByTypeAndName(ctx,
+		data.Domain.ValueString(),
+		data.Type.ValueString(),
+		data.Name.ValueString())
+	
+	// If we can't check for existing records due to API error (not 404), proceed with creation
+	hasExistingRecords := false
 	if err != nil {
-		resp.Diagnostics.AddError(
-			"Error Creating DNS Record",
-			fmt.Sprintf("Could not create DNS record: %s", err),
-		)
-		return
+		if !strings.Contains(err.Error(), "404") {
+			tflog.Warn(ctx, "Could not check for existing DNS records, proceeding with creation", map[string]interface{}{
+				"domain": data.Domain.ValueString(),
+				"type":   data.Type.ValueString(),
+				"name":   data.Name.ValueString(),
+				"error":  err.Error(),
+			})
+		}
+	} else if len(existingRecords) > 0 {
+		hasExistingRecords = true
+		tflog.Debug(ctx, "Found existing DNS records", map[string]interface{}{
+			"domain":      data.Domain.ValueString(),
+			"type":        data.Type.ValueString(),
+			"name":        data.Name.ValueString(),
+			"recordCount": len(existingRecords),
+			"allowOverwrite": data.AllowOverwrite.ValueBool(),
+		})
+	}
+
+	// Handle conflict resolution
+	if hasExistingRecords {
+		if !data.AllowOverwrite.ValueBool() {
+			// List existing record data for better error message
+			var existingData []string
+			for _, record := range existingRecords {
+				existingData = append(existingData, record.Data)
+			}
+			resp.Diagnostics.AddError(
+				"DNS Record Already Exists",
+				fmt.Sprintf("DNS record %s.%s already exists for domain %s with data: [%s]. "+
+					"Set allow_overwrite = true to replace existing records, or use terraform import to manage existing records.",
+					data.Name.ValueString(), data.Type.ValueString(), data.Domain.ValueString(),
+					strings.Join(existingData, ", ")),
+			)
+			return
+		} else {
+			// Replace existing records with the new one
+			tflog.Info(ctx, "Overwriting existing DNS records due to allow_overwrite = true", map[string]interface{}{
+				"domain":           data.Domain.ValueString(),
+				"type":             data.Type.ValueString(),
+				"name":             data.Name.ValueString(),
+				"existingRecords":  len(existingRecords),
+			})
+			
+			err = r.client.ReplaceDNSRecordsByTypeAndName(ctx,
+				data.Domain.ValueString(),
+				data.Type.ValueString(),
+				data.Name.ValueString(),
+				[]godaddy.DNSRecord{record})
+			if err != nil {
+				resp.Diagnostics.AddError(
+					"Error Overwriting DNS Record",
+					fmt.Sprintf("Could not overwrite existing DNS record: %s", err),
+				)
+				return
+			}
+		}
+	} else {
+		// No existing records, create new one
+		tflog.Debug(ctx, "Creating new DNS record (no conflicts found)")
+		err = r.client.AddDNSRecord(ctx, data.Domain.ValueString(), record)
+		if err != nil {
+			resp.Diagnostics.AddError(
+				"Error Creating DNS Record",
+				fmt.Sprintf("Could not create DNS record: %s", err),
+			)
+			return
+		}
 	}
 
 	// Generate ID
