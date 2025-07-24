@@ -7,8 +7,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
+
+// RateLimitResponse represents the structure of rate limit error response
+type RateLimitResponse struct {
+	Code          string `json:"code"`
+	Message       string `json:"message"`
+	RetryAfterSec int    `json:"retryAfterSec"`
+}
 
 const (
 	productionURL = "https://api.godaddy.com"
@@ -54,6 +63,12 @@ func NewClient(apiKey, apiSecret string, opts ...ClientOption) *Client {
 }
 
 func (c *Client) doRequest(ctx context.Context, method, path string, body interface{}) (*http.Response, error) {
+	return c.doRequestWithRetry(ctx, method, path, body, 0)
+}
+
+func (c *Client) doRequestWithRetry(ctx context.Context, method, path string, body interface{}, retryCount int) (*http.Response, error) {
+	const maxRetries = 3
+	
 	var bodyReader io.Reader
 	if body != nil {
 		jsonBody, err := json.Marshal(body)
@@ -80,10 +95,77 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 	if resp.StatusCode >= 400 {
 		defer resp.Body.Close()
 		bodyBytes, _ := io.ReadAll(resp.Body)
+		
+		// Handle rate limiting with intelligent retry
+		if resp.StatusCode == 429 && retryCount < maxRetries {
+			fmt.Printf("RATE LIMIT HIT: %s %s - Status: %d, Body: %s (Retry %d/%d)\n",
+				req.Method, req.URL.Path, resp.StatusCode, string(bodyBytes), retryCount+1, maxRetries)
+			
+			// Parse retryAfterSec from response body
+			waitTime := c.parseRetryAfter(bodyBytes)
+			if waitTime > 0 {
+				fmt.Printf("Waiting %d seconds before retry as specified by GoDaddy API\n", waitTime)
+				select {
+				case <-time.After(time.Duration(waitTime) * time.Second):
+					// Continue with retry
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			} else {
+				// Fallback exponential backoff if retryAfterSec not found
+				backoffTime := time.Duration(1<<uint(retryCount)) * time.Second
+				fmt.Printf("Using exponential backoff: waiting %v before retry\n", backoffTime)
+				select {
+				case <-time.After(backoffTime):
+					// Continue with retry
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			
+			// Recursive retry
+			return c.doRequestWithRetry(ctx, method, path, body, retryCount+1)
+		}
+		
+		// DIAGNOSTIC LOG for non-429 errors or max retries reached
+		if resp.StatusCode == 429 {
+			fmt.Printf("RATE LIMIT EXHAUSTED: Max retries (%d) reached for %s %s\n",
+				maxRetries, req.Method, req.URL.Path)
+		}
+		
 		return nil, fmt.Errorf("API error: status %d, body: %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	return resp, nil
+}
+
+// parseRetryAfter extracts retryAfterSec from GoDaddy's rate limit response
+func (c *Client) parseRetryAfter(bodyBytes []byte) int {
+	var rateLimitResp RateLimitResponse
+	if err := json.Unmarshal(bodyBytes, &rateLimitResp); err == nil && rateLimitResp.RetryAfterSec > 0 {
+		return rateLimitResp.RetryAfterSec
+	}
+	
+	// Fallback: try to extract from message string
+	bodyStr := string(bodyBytes)
+	if strings.Contains(bodyStr, "retryAfterSec") {
+		// Look for "retryAfterSec":51 pattern
+		start := strings.Index(bodyStr, "retryAfterSec\":")
+		if start != -1 {
+			start += len("retryAfterSec\":")
+			end := start
+			for end < len(bodyStr) && bodyStr[end] >= '0' && bodyStr[end] <= '9' {
+				end++
+			}
+			if waitTimeStr := bodyStr[start:end]; len(waitTimeStr) > 0 {
+				if waitTime, err := strconv.Atoi(waitTimeStr); err == nil {
+					return waitTime
+				}
+			}
+		}
+	}
+	
+	return 0 // No valid retry time found
 }
 
 func (c *Client) Get(ctx context.Context, path string, result interface{}) error {
