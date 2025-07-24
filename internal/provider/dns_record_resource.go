@@ -337,14 +337,28 @@ func (r *DNSRecordResource) Update(ctx context.Context, req resource.UpdateReque
 	// Get all records of this type and name
 	records, err := r.client.GetDNSRecordsByTypeAndName(ctx, data.Domain.ValueString(), data.Type.ValueString(), data.Name.ValueString())
 	if err != nil {
-		// Handle 404 errors like Read() function does
+		// Handle 404 errors with upsert behavior (create if doesn't exist)
 		if strings.Contains(err.Error(), "404") {
-			tflog.Warn(ctx, "DNS record not found during update - removing from state", map[string]interface{}{
+			tflog.Info(ctx, "DNS record not found during update - creating new record (upsert behavior)", map[string]interface{}{
 				"domain": data.Domain.ValueString(),
 				"type":   data.Type.ValueString(),
 				"name":   data.Name.ValueString(),
+				"data":   data.Data.ValueString(),
 			})
-			resp.State.RemoveResource(ctx)
+			
+			// Create the record since it doesn't exist
+			record := r.modelToRecord(&data)
+			err = r.client.AddDNSRecord(ctx, data.Domain.ValueString(), record)
+			if err != nil {
+				resp.Diagnostics.AddError(
+					"Error Creating DNS Record During Update",
+					fmt.Sprintf("Could not create DNS record during update (upsert): %s", err),
+				)
+				return
+			}
+			
+			// Update the state with the new record
+			resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 			return
 		}
 		// DIAGNOSTIC LOG: Non-404 errors
