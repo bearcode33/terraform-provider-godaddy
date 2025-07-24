@@ -309,6 +309,11 @@ func (r *DNSRecordResource) Delete(ctx context.Context, req resource.DeleteReque
 	if err != nil {
 		if strings.Contains(err.Error(), "404") {
 			// Already deleted
+			tflog.Debug(ctx, "DNS record already deleted (404)", map[string]interface{}{
+				"domain": data.Domain.ValueString(),
+				"type":   data.Type.ValueString(),
+				"name":   data.Name.ValueString(),
+			})
 			return
 		}
 		resp.Diagnostics.AddError(
@@ -318,47 +323,153 @@ func (r *DNSRecordResource) Delete(ctx context.Context, req resource.DeleteReque
 		return
 	}
 
+	tflog.Debug(ctx, "Retrieved DNS records for deletion", map[string]interface{}{
+		"domain":      data.Domain.ValueString(),
+		"type":        data.Type.ValueString(),
+		"name":        data.Name.ValueString(),
+		"recordCount": len(records),
+		"targetData":  data.Data.ValueString(),
+	})
+
+	// Check for empty records slice to prevent panic
+	if len(records) == 0 {
+		tflog.Warn(ctx, "No DNS records found for deletion, but no 404 error returned", map[string]interface{}{
+			"domain": data.Domain.ValueString(),
+			"type":   data.Type.ValueString(),
+			"name":   data.Name.ValueString(),
+		})
+		// Already deleted or doesn't exist
+		return
+	}
+
 	// Remove the matching record
-	newRecords := make([]godaddy.DNSRecord, 0, len(records)-1)
+	// CRITICAL FIX: Use len(records) instead of len(records)-1 for capacity
+	// This prevents panic when len(records) could be 0
+	newRecords := make([]godaddy.DNSRecord, 0, len(records))
+	var recordFound bool
 	for _, record := range records {
 		if record.Data != data.Data.ValueString() {
 			newRecords = append(newRecords, record)
+		} else {
+			recordFound = true
+			tflog.Debug(ctx, "Found matching DNS record to delete", map[string]interface{}{
+				"domain": data.Domain.ValueString(),
+				"type":   data.Type.ValueString(),
+				"name":   data.Name.ValueString(),
+				"data":   record.Data,
+			})
 		}
 	}
 
+	if !recordFound {
+		tflog.Warn(ctx, "Target DNS record not found in retrieved records", map[string]interface{}{
+			"domain":     data.Domain.ValueString(),
+			"type":       data.Type.ValueString(),
+			"name":       data.Name.ValueString(),
+			"targetData": data.Data.ValueString(),
+		})
+		// Record already deleted or doesn't match
+		return
+	}
+
+	tflog.Debug(ctx, "Processing DNS record deletion", map[string]interface{}{
+		"domain":         data.Domain.ValueString(),
+		"type":           data.Type.ValueString(),
+		"name":           data.Name.ValueString(),
+		"remainingCount": len(newRecords),
+		"willDeleteAll":  len(newRecords) == 0,
+	})
+
 	if len(newRecords) == 0 {
 		// Delete all records of this type and name
+		tflog.Debug(ctx, "Deleting all DNS records of this type and name")
 		err = r.client.DeleteDNSRecord(ctx, data.Domain.ValueString(), data.Type.ValueString(), data.Name.ValueString())
 	} else {
 		// Replace with remaining records
+		tflog.Debug(ctx, "Replacing with remaining DNS records", map[string]interface{}{
+			"remainingRecords": len(newRecords),
+		})
 		err = r.client.ReplaceDNSRecordsByTypeAndName(ctx, data.Domain.ValueString(), data.Type.ValueString(), data.Name.ValueString(), newRecords)
 	}
 
-	if err != nil && !strings.Contains(err.Error(), "404") {
-		resp.Diagnostics.AddError(
-			"Error Deleting DNS Record",
-			fmt.Sprintf("Could not delete DNS record: %s", err),
-		)
-		return
+	if err != nil {
+		if strings.Contains(err.Error(), "404") {
+			tflog.Debug(ctx, "DNS record already deleted during final operation (404)")
+		} else {
+			resp.Diagnostics.AddError(
+				"Error Deleting DNS Record",
+				fmt.Sprintf("Could not delete DNS record: %s", err),
+			)
+			return
+		}
 	}
+
+	tflog.Debug(ctx, "DNS record deletion completed successfully", map[string]interface{}{
+		"domain": data.Domain.ValueString(),
+		"type":   data.Type.ValueString(),
+		"name":   data.Name.ValueString(),
+		"data":   data.Data.ValueString(),
+	})
 }
 
 func (r *DNSRecordResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	// Expected format: domain/type/name/data
+	// Alternative format: domain/type/name (will auto-detect data from existing records)
 	parts := strings.Split(req.ID, "/")
-	if len(parts) != 4 {
+	if len(parts) != 3 && len(parts) != 4 {
 		resp.Diagnostics.AddError(
 			"Invalid Import ID",
-			"Import ID must be in the format: domain/type/name/data",
+			"Import ID must be in the format: domain/type/name/data or domain/type/name (auto-detect data)",
 		)
 		return
 	}
 
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("domain"), parts[0])...)
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("type"), parts[1])...)
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("name"), parts[2])...)
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("data"), parts[3])...)
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), req.ID)...)
+	domain := parts[0]
+	recordType := parts[1]
+	name := parts[2]
+	var data string
+
+	if len(parts) == 4 {
+		// Full format provided
+		data = parts[3]
+	} else {
+		// Auto-detect data from existing records
+		records, err := r.client.GetDNSRecordsByTypeAndName(ctx, domain, recordType, name)
+		if err != nil {
+			resp.Diagnostics.AddError(
+				"Error Reading DNS Records for Import",
+				fmt.Sprintf("Could not read DNS records for %s/%s/%s: %s", domain, recordType, name, err),
+			)
+			return
+		}
+
+		if len(records) == 0 {
+			resp.Diagnostics.AddError(
+				"No DNS Records Found",
+				fmt.Sprintf("No DNS records found for %s/%s/%s", domain, recordType, name),
+			)
+			return
+		}
+
+		if len(records) > 1 {
+			resp.Diagnostics.AddError(
+				"Multiple DNS Records Found",
+				fmt.Sprintf("Multiple DNS records found for %s/%s/%s. Please specify the data value: %s/type/name/data", domain, recordType, name, domain),
+			)
+			return
+		}
+
+		data = records[0].Data
+	}
+
+	// Generate the full ID
+	importID := fmt.Sprintf("%s/%s/%s/%s", domain, recordType, name, data)
+
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("domain"), domain)...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("type"), recordType)...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("name"), name)...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("data"), data)...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), importID)...)
 }
 
 func (r *DNSRecordResource) modelToRecord(model *DNSRecordResourceModel) godaddy.DNSRecord {

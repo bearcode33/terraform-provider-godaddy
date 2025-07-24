@@ -60,7 +60,22 @@ dist/
 # Ignore local test files
 test/
 testing/
+test-*.tf
+*-test.tf
+*.auto.tfvars
+*.auto.tfvars.json
 
 # Ignore environment files
 .env
 .env.local
+.env.*
+*credentials*
+*secrets*
+*keys*
+
+# Terraform lock files
+.terraform.lock.hcl
+
+# Additional security - any files that might contain API keys
+terraform.tfplan
+*.tfplan

@@ -10,6 +10,7 @@ A comprehensive Terraform provider for managing GoDaddy domains and DNS records 
 
 - 🏗️ **Complete Domain Management**: Configure domain settings, nameservers, and contacts
 - 🌐 **Full DNS Support**: All 18+ DNS record types with intelligent validation
+- 📥 **Easy Import**: Import existing GoDaddy resources with automated discovery tools
 - 🔒 **Security First**: Built-in validation, error handling, and secure API authentication
 - 📚 **Production Ready**: Comprehensive tests, examples, and documentation
 - 🚀 **Easy to Use**: Intuitive Terraform configuration with helpful error messages
@@ -342,6 +343,38 @@ DNS record type "INVALID" is not supported. Valid types are: [A, AAAA, CAA, CNAM
 Error: Invalid DNS Record Configuration
 SRV records require both service and protocol fields
 ```
+
+## Importing Existing Resources
+
+This provider includes powerful tools to import your existing GoDaddy domains and DNS records into Terraform.
+
+### Quick Import with Helper Script
+
+```bash
+# Discover all resources for a domain
+./scripts/import-helper.sh -d example.com -t all
+
+# List DNS records with import commands
+./scripts/import-helper.sh -d example.com
+
+# Get domain information
+./scripts/import-helper.sh -d example.com -t domain
+```
+
+### Import Commands
+
+```bash
+# Import a domain
+terraform import godaddy_domain.example "example.com"
+
+# Import DNS records (simplified format - auto-detects data)
+terraform import godaddy_dns_record.www_a "example.com/A/www"
+
+# Import DNS records (full format)
+terraform import godaddy_dns_record.www_a "example.com/A/www/192.0.2.1"
+```
+
+📖 **[Complete Import Guide](README-import.md)** - Detailed instructions with examples and troubleshooting
 
 ## Examples
 
